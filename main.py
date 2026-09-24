@@ -1,7 +1,7 @@
-"""Localhost neuron Pong plus an optional AI SDK agent demonstration.
+"""Localhost neuron Pong plus an optional AI SDK agent.
 
-Run ``python main.py`` for Pong or ``python main.py --agent`` for the small
-AI SDK example. The Pong neurons remain localhost-only.
+The visual game uses tkinter, which is included with normal Windows Python
+installations. No pygame or other graphics package is required.
 """
 
 import asyncio
@@ -17,11 +17,6 @@ from pathlib import Path
 
 import requests
 from flask import Flask, jsonify, request
-
-try:
-    import pygame
-except ImportError:
-    pygame = None
 
 FEATURES = ["ball_x", "ball_y", "ball_dx", "ball_dy", "paddle_y"]
 ACTIONS = {"up": 5001, "stay": 5002, "down": 5003}
@@ -112,6 +107,7 @@ def save_weights(path, weights):
 
 
 def create_neuron_app(action, weight_file):
+    """Create one Flask neuron. HTTP requests are local signals."""
     app = Flask(__name__)
     weights = load_weights(weight_file)
 
@@ -173,7 +169,7 @@ class TinyBrain:
                 scores[action] = float(response.json().get("score", 0.0))
             except requests.RequestException as exc:
                 if action not in self.reported_failures:
-                    print(f"Neuron {action} unavailable at {url}: {exc}")
+                    print(f"Neuron {action} unavailable: {exc}")
                     self.reported_failures.add(action)
                 scores[action] = 0.0
         return max(scores, key=scores.get), scores
@@ -194,10 +190,10 @@ def start_neurons():
     processes = []
     for action, port in ACTIONS.items():
         weight_file = PROJECT_DIR / ".brain_weights" / f"{action}.json"
-        processes.append(subprocess.Popen(
-            [sys.executable, str(PROJECT_DIR / "main.py"), "--neuron", action,
-             str(port), str(weight_file)], cwd=str(PROJECT_DIR)
-        ))
+        processes.append(subprocess.Popen([
+            sys.executable, str(PROJECT_DIR / "main.py"), "--neuron", action,
+            str(port), str(weight_file)
+        ], cwd=str(PROJECT_DIR)))
     return processes
 
 
@@ -215,65 +211,68 @@ def wait_for_neurons(endpoints, processes, seconds=12.0):
         if pending:
             time.sleep(0.15)
     if pending:
-        raise RuntimeError(f"Neuron services did not become ready: {', '.join(sorted(pending))}")
-
-
-def draw_game(screen, game, font, episode, hits, reward):
-    screen.fill((15, 20, 35))
-    pygame.draw.rect(screen, (230, 230, 240),
-                     (game.paddle_x, game.paddle_y, game.PADDLE_W, game.PADDLE_H))
-    pygame.draw.circle(screen, (80, 220, 150),
-                       (int(game.ball_x), int(game.ball_y)), game.BALL_SIZE // 2)
-    text = f"Episode {episode}  Score {hits}  Reward {reward:.1f}  Local neurons learning"
-    screen.blit(font.render(text, True, (240, 240, 240)), (10, 10))
-    pygame.display.flip()
+        raise RuntimeError(f"Neuron services not ready: {', '.join(sorted(pending))}")
 
 
 def run_game_loop():
-    if os.environ.get("HEADLESS") != "1" and pygame is None:
-        raise RuntimeError("Pygame is not installed. Run: python -m pip install pygame")
+    # tkinter is part of the standard Windows Python distribution and avoids
+    # the native pygame dependency that does not install on Python 3.14.
+    try:
+        import tkinter as tk
+    except ImportError as exc:
+        raise RuntimeError("Tkinter is unavailable in this Python installation") from exc
+
     processes = start_neurons()
-    screen = None
     try:
         endpoints = {a: f"http://127.0.0.1:{p}" for a, p in ACTIONS.items()}
         wait_for_neurons(endpoints, processes)
         brain, game = TinyBrain(endpoints), PongGame()
-        episode, total_reward, hits, frames = 1, 0.0, 0, 0
-        clock = font = None
-        if os.environ.get("HEADLESS") != "1":
-            pygame.init()
-            screen = pygame.display.set_mode((game.WIDTH, game.HEIGHT))
-            pygame.display.set_caption("Localhost Neuron Pong")
-            clock, font = pygame.time.Clock(), pygame.font.Font(None, 24)
+        root = tk.Tk()
+        root.title("Localhost Neuron Pong")
+        canvas = tk.Canvas(root, width=game.WIDTH, height=game.HEIGHT, bg="#0f1423")
+        canvas.pack()
+        info = tk.StringVar(value="Starting local neurons...")
+        tk.Label(root, textvariable=info).pack()
+        state = {"episode": 1, "reward": 0.0, "hits": 0, "frames": 0, "running": True}
 
-        running = True
-        while running:
-            if screen:
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        running = False
+        def close():
+            state["running"] = False
+            root.destroy()
+
+        root.protocol("WM_DELETE_WINDOW", close)
+
+        def tick():
+            if not state["running"]:
+                return
             observation = game.observation().as_dict()
             action, scores = brain.choose_action(observation)
             _, reward, done, hit = game.step(action)
             brain.learn(action, observation, reward)
-            total_reward += reward
-            hits += int(hit)
-            frames += 1
-            if screen:
-                draw_game(screen, game, font, episode, hits, total_reward)
-                clock.tick(60)
-            elif frames % 60 == 0:
-                print(f"episode={episode} score={hits} reward={total_reward:.1f} last={action} scores={scores}")
+            state["reward"] += reward
+            state["hits"] += int(hit)
+            state["frames"] += 1
+            canvas.delete("all")
+            canvas.create_rectangle(game.paddle_x, game.paddle_y,
+                                    game.paddle_x + game.PADDLE_W,
+                                    game.paddle_y + game.PADDLE_H, fill="#eeeeee")
+            canvas.create_oval(game.ball_x - 6, game.ball_y - 6,
+                               game.ball_x + 6, game.ball_y + 6, fill="#50dc96")
+            info.set(f"Episode {state['episode']} | Score {state['hits']} | "
+                     f"Reward {state['reward']:.1f} | Last: {action}")
             if done:
-                episode, total_reward, hits = episode + 1, 0.0, 0
+                state["episode"] += 1
+                state["reward"] = 0.0
+                state["hits"] = 0
                 game.reset()
+            root.after(16, tick)
+
+        tick()
+        root.mainloop()
     except KeyboardInterrupt:
         print("Stopping experiment...")
     except Exception:
         traceback.print_exc()
     finally:
-        if screen is not None and pygame is not None:
-            pygame.quit()
         for process in processes:
             process.terminate()
         for process in processes:
@@ -284,16 +283,8 @@ def run_game_loop():
 
 
 async def run_ai_agent():
-    """Run the requested AI SDK agent example with full traceback reporting."""
     try:
         import ai
-
-        # Supported examples include:
-        # ai.get_model()                         # reads AI_SDK_DEFAULT_MODEL
-        # ai.get_model("openai/gpt-5.4")        # gateway default
-        # ai.get_model("gateway:openai/gpt-5.4")
-        # ai.get_model("openai:gpt-5.4")
-        # ai.get_model("anthropic:claude-sonnet-4-6")
         model_name = os.environ.get("AI_SDK_DEFAULT_MODEL", "anthropic/claude-sonnet-4")
         model = ai.get_model(model_name)
 
@@ -307,7 +298,6 @@ async def run_ai_agent():
             ai.system_message("Use the contact_mothership tool when asked about the future."),
             ai.user_message("When will the robots take over?"),
         ]
-
         async with agent.run(model, messages) as stream:
             async for event in stream:
                 if isinstance(event, ai.events.TextDelta):
