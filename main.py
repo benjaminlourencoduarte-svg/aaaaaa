@@ -1,278 +1,104 @@
-"""Localhost neuron Pong plus an optional AI SDK agent.
+"""Pong controller and two-AI Pong demonstration.
 
-The visual game uses tkinter, which is included with normal Windows Python
-installations. No pygame or other graphics package is required.
+Run ``python main.py`` for the existing localhost-neuron Pong controller.
+Run ``python main.py --agent`` for a two-AI horizontal Pong match.
+
+The AI match sends JSON observations to two models. Each model must answer with
+exactly ``left - CRL`` or ``right - LRC`` (``stay`` is accepted as a safe
+fallback). Both prompts include the other model's name and prompt.
 """
 
 import asyncio
 import json
 import os
-import random
 import subprocess
 import sys
 import time
 import traceback
-from dataclasses import dataclass
 from pathlib import Path
 
-import requests
-from flask import Flask, jsonify, request
+from brain import TinyBrain
+from pong_game import PongGame
 
-FEATURES = ["ball_x", "ball_y", "ball_dx", "ball_dy", "paddle_y"]
 ACTIONS = {"up": 5001, "stay": 5002, "down": 5003}
 PROJECT_DIR = Path(__file__).resolve().parent
 
 
-@dataclass
-class Observation:
-    ball_x: float
-    ball_y: float
-    ball_dx: float
-    ball_dy: float
-    paddle_y: float
-
-    def as_dict(self):
-        return self.__dict__.copy()
-
-
-class PongGame:
-    WIDTH, HEIGHT = 640, 400
-    PADDLE_W, PADDLE_H = 14, 80
-    BALL_SIZE = 12
-
-    def __init__(self):
-        self.paddle_x = 35
-        self.paddle_speed = 6
-        self.reset()
-
-    def reset(self):
-        self.paddle_y = self.HEIGHT / 2 - self.PADDLE_H / 2
-        self.ball_x = self.WIDTH / 2
-        self.ball_y = random.uniform(60, self.HEIGHT - 60)
-        self.ball_dx = random.choice([-4.0, 4.0])
-        self.ball_dy = random.choice([-3.0, 3.0])
-
-    def observation(self):
-        return Observation(
-            self.ball_x / self.WIDTH,
-            self.ball_y / self.HEIGHT,
-            self.ball_dx / 4.0,
-            self.ball_dy / 3.0,
-            (self.paddle_y + self.PADDLE_H / 2) / self.HEIGHT,
-        )
-
-    def step(self, action):
-        if action == "up":
-            self.paddle_y -= self.paddle_speed
-        elif action == "down":
-            self.paddle_y += self.paddle_speed
-        self.paddle_y = max(0, min(self.HEIGHT - self.PADDLE_H, self.paddle_y))
-        self.ball_x += self.ball_dx
-        self.ball_y += self.ball_dy
-        if self.ball_y <= 0 or self.ball_y + self.BALL_SIZE >= self.HEIGHT:
-            self.ball_dy *= -1
-
-        hit = False
-        reward = 0.0
-        if self.ball_dx < 0 and self.ball_x <= self.paddle_x + self.PADDLE_W:
-            if self.paddle_y <= self.ball_y <= self.paddle_y + self.PADDLE_H:
-                self.ball_x = self.paddle_x + self.PADDLE_W
-                self.ball_dx = abs(self.ball_dx) * 1.03
-                hit, reward = True, 1.0
-
-        missed = self.ball_x < -self.BALL_SIZE
-        if missed:
-            reward = -2.0
-        elif self.ball_x > self.WIDTH:
-            self.ball_x = self.WIDTH - self.BALL_SIZE
-            self.ball_dx *= -1
-        return self.observation(), reward, missed, hit
-
-
-def load_weights(path):
-    if path and os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                return json.load(handle)
-        except Exception:
-            traceback.print_exc()
-    return {"bias": random.uniform(-0.1, 0.1), **{n: random.uniform(-1, 1) for n in FEATURES}}
-
-
-def save_weights(path, weights):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(weights, handle, indent=2)
-
-
-def create_neuron_app(action, weight_file):
-    """Create one Flask neuron. HTTP requests are local signals."""
-    app = Flask(__name__)
-    weights = load_weights(weight_file)
-
-    @app.get("/health")
-    def health():
-        return jsonify({"ok": True, "action": action})
-
-    @app.post("/signal")
-    def signal():
-        try:
-            observation = request.get_json(force=True) or {}
-            score = weights["bias"] + sum(
-                weights[name] * float(observation.get(name, 0.0)) for name in FEATURES
-            )
-            return jsonify({"action": action, "score": score})
-        except Exception as exc:
-            traceback.print_exc()
-            return jsonify({"error": str(exc), "action": action, "score": 0.0}), 400
-
-    @app.post("/feedback")
-    def feedback():
-        try:
-            payload = request.get_json(force=True) or {}
-            reward = float(payload.get("reward", 0.0))
-            observation = payload.get("observation", {})
-            rate = float(payload.get("learning_rate", 0.05))
-            direction = 1.0 if reward > 0 else -1.0
-            for name in FEATURES:
-                value = max(-1.0, min(1.0, float(observation.get(name, 0.0))))
-                weights[name] += rate * direction * abs(reward) * value
-            weights["bias"] += rate * direction * abs(reward) * 0.1
-            save_weights(weight_file, weights)
-            return jsonify({"ok": True, "action": action})
-        except Exception as exc:
-            traceback.print_exc()
-            return jsonify({"error": str(exc)}), 400
-
-    return app
-
-
-def run_neuron_service(action, port, weight_file):
-    create_neuron_app(action, weight_file).run(
-        host="127.0.0.1", port=port, threaded=True, use_reloader=False
-    )
-
-
-class TinyBrain:
-    def __init__(self, endpoints):
-        self.endpoints = endpoints
-        self.timeout = (0.08, 0.20)
-        self.reported_failures = set()
-
-    def choose_action(self, observation):
-        scores = {}
-        for action, url in self.endpoints.items():
-            try:
-                response = requests.post(url + "/signal", json=observation, timeout=self.timeout)
-                response.raise_for_status()
-                scores[action] = float(response.json().get("score", 0.0))
-            except requests.RequestException as exc:
-                if action not in self.reported_failures:
-                    print(f"Neuron {action} unavailable: {exc}")
-                    self.reported_failures.add(action)
-                scores[action] = 0.0
-        return max(scores, key=scores.get), scores
-
-    def learn(self, action, observation, reward):
-        try:
-            response = requests.post(
-                self.endpoints[action] + "/feedback",
-                json={"observation": observation, "reward": reward, "learning_rate": 0.05},
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-        except requests.RequestException:
-            pass
-
+# ---------------------------------------------------------------------------
+# Existing localhost-neuron Pong mode
+# ---------------------------------------------------------------------------
 
 def start_neurons():
     processes = []
     for action, port in ACTIONS.items():
         weight_file = PROJECT_DIR / ".brain_weights" / f"{action}.json"
-        processes.append(subprocess.Popen([
-            sys.executable, str(PROJECT_DIR / "main.py"), "--neuron", action,
-            str(port), str(weight_file)
-        ], cwd=str(PROJECT_DIR)))
+        processes.append(subprocess.Popen(
+            [sys.executable, str(PROJECT_DIR / "neuron_service.py"), action,
+             str(port), str(weight_file)], cwd=str(PROJECT_DIR)
+        ))
     return processes
 
 
-def wait_for_neurons(endpoints, processes, seconds=12.0):
-    deadline = time.monotonic() + seconds
-    pending = set(endpoints)
-    while pending and time.monotonic() < deadline:
-        for action in tuple(pending):
-            try:
-                response = requests.get(endpoints[action] + "/health", timeout=(0.1, 0.25))
-                if response.ok:
-                    pending.remove(action)
-            except requests.RequestException:
-                pass
-        if pending:
-            time.sleep(0.15)
-    if pending:
-        raise RuntimeError(f"Neuron services not ready: {', '.join(sorted(pending))}")
-
-
-def run_game_loop():
-    # tkinter is part of the standard Windows Python distribution and avoids
-    # the native pygame dependency that does not install on Python 3.14.
-    try:
-        import tkinter as tk
-    except ImportError as exc:
-        raise RuntimeError("Tkinter is unavailable in this Python installation") from exc
-
+def run():
+    """Run the original local Flask-neuron Pong experiment."""
     processes = start_neurons()
+    screen = None
+    pygame = None
     try:
-        endpoints = {a: f"http://127.0.0.1:{p}" for a, p in ACTIONS.items()}
-        wait_for_neurons(endpoints, processes)
-        brain, game = TinyBrain(endpoints), PongGame()
-        root = tk.Tk()
-        root.title("Localhost Neuron Pong")
-        canvas = tk.Canvas(root, width=game.WIDTH, height=game.HEIGHT, bg="#0f1423")
-        canvas.pack()
-        info = tk.StringVar(value="Starting local neurons...")
-        tk.Label(root, textvariable=info).pack()
-        state = {"episode": 1, "reward": 0.0, "hits": 0, "frames": 0, "running": True}
-
-        def close():
-            state["running"] = False
-            root.destroy()
-
-        root.protocol("WM_DELETE_WINDOW", close)
-
-        def tick():
-            if not state["running"]:
-                return
-            observation = game.observation().as_dict()
-            action, scores = brain.choose_action(observation)
-            _, reward, done, hit = game.step(action)
-            brain.learn(action, observation, reward)
-            state["reward"] += reward
-            state["hits"] += int(hit)
-            state["frames"] += 1
-            canvas.delete("all")
-            canvas.create_rectangle(game.paddle_x, game.paddle_y,
-                                    game.paddle_x + game.PADDLE_W,
-                                    game.paddle_y + game.PADDLE_H, fill="#eeeeee")
-            canvas.create_oval(game.ball_x - 6, game.ball_y - 6,
-                               game.ball_x + 6, game.ball_y + 6, fill="#50dc96")
-            info.set(f"Episode {state['episode']} | Score {state['hits']} | "
-                     f"Reward {state['reward']:.1f} | Last: {action}")
-            if done:
-                state["episode"] += 1
-                state["reward"] = 0.0
-                state["hits"] = 0
-                game.reset()
-            root.after(16, tick)
-
-        tick()
-        root.mainloop()
+        time.sleep(1.0)
+        brain = TinyBrain({a: f"http://127.0.0.1:{p}" for a, p in ACTIONS.items()})
+        game = PongGame()
+        if os.environ.get("HEADLESS") == "1":
+            while True:
+                observation = game.observation().as_dict()
+                action, _ = brain.choose_action(observation)
+                _, reward, done, _ = game.step(action)
+                brain.learn(action, observation, reward)
+                if done:
+                    game.reset()
+        else:
+            import pygame
+            pygame.init()
+            screen = pygame.display.set_mode((game.WIDTH, game.HEIGHT))
+            pygame.display.set_caption("Localhost Neuron Pong")
+            clock = pygame.time.Clock()
+            font = pygame.font.Font(None, 24)
+            episode = hits = frames = 0
+            total_reward = 0.0
+            running = True
+            while running:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        running = False
+                observation = game.observation().as_dict()
+                action, scores = brain.choose_action(observation)
+                _, reward, done, hit = game.step(action)
+                brain.learn(action, observation, reward)
+                total_reward += reward
+                hits += int(hit)
+                frames += 1
+                screen.fill((15, 20, 35))
+                pygame.draw.rect(screen, (230, 230, 240),
+                                 (game.paddle_x, game.paddle_y,
+                                  game.PADDLE_W, game.PADDLE_H))
+                pygame.draw.circle(screen, (80, 220, 150),
+                                   (int(game.ball_x), int(game.ball_y)), game.BALL_SIZE // 2)
+                text = f"Episode {episode}  Score {hits}  Reward {total_reward:.1f}"
+                screen.blit(font.render(text, True, (240, 240, 240)), (10, 10))
+                pygame.display.flip()
+                clock.tick(60)
+                if done:
+                    episode += 1
+                    hits = 0
+                    total_reward = 0.0
+                    game.reset()
     except KeyboardInterrupt:
         print("Stopping experiment...")
     except Exception:
         traceback.print_exc()
     finally:
+        if screen is not None and pygame is not None:
+            pygame.quit()
         for process in processes:
             process.terminate()
         for process in processes:
@@ -282,41 +108,205 @@ def run_game_loop():
                 process.kill()
 
 
+# ---------------------------------------------------------------------------
+# Two-AI horizontal Pong mode
+# ---------------------------------------------------------------------------
+
+LEFT = "left - CRL"
+RIGHT = "right - LRC"
+STAY = "stay"
+AI_PROMPT = (
+    "You control one horizontal Pong paddle. Reply with exactly one action: "
+    "left - CRL, right - LRC, or stay. Do not add punctuation or explanation. "
+    "Use the JSON observation to move toward the ball."
+)
+
+
+class HorizontalPong:
+    WIDTH, HEIGHT = 720, 440
+    PADDLE_W, PADDLE_H = 110, 14
+    BALL = 12
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.ball_x, self.ball_y = self.WIDTH / 2, self.HEIGHT / 2
+        self.ball_dx = 5.0
+        self.ball_dy = 4.0
+        self.top_x = self.WIDTH / 2 - self.PADDLE_W / 2
+        self.bottom_x = self.WIDTH / 2 - self.PADDLE_W / 2
+        self.top_score = self.bottom_score = 0
+
+    def observation(self, side, opponent_model, opponent_prompt):
+        paddle_x = self.top_x if side == "top" else self.bottom_x
+        opponent_x = self.bottom_x if side == "top" else self.top_x
+        return {
+            "side": side,
+            "ball": {"x": round(self.ball_x, 2), "y": round(self.ball_y, 2),
+                      "dx": round(self.ball_dx, 2), "dy": round(self.ball_dy, 2)},
+            "your_paddle": {"x": round(paddle_x, 2), "width": self.PADDLE_W},
+            "opponent_paddle": {"x": round(opponent_x, 2), "width": self.PADDLE_W},
+            "board": {"width": self.WIDTH, "height": self.HEIGHT},
+            "opponent_model": opponent_model,
+            "opponent_prompt": opponent_prompt,
+        }
+
+    def move(self, side, action):
+        if action == LEFT:
+            change = -18
+        elif action == RIGHT:
+            change = 18
+        else:
+            change = 0
+        if side == "top":
+            self.top_x = max(0, min(self.WIDTH - self.PADDLE_W, self.top_x + change))
+        else:
+            self.bottom_x = max(0, min(self.WIDTH - self.PADDLE_W, self.bottom_x + change))
+
+    def step(self):
+        self.ball_x += self.ball_dx
+        self.ball_y += self.ball_dy
+        if self.ball_x <= 0 or self.ball_x >= self.WIDTH:
+            self.ball_dx *= -1
+
+        winner = None
+        if self.ball_dy < 0 and self.ball_y <= self.PADDLE_H + self.BALL:
+            if self.top_x - self.BALL <= self.ball_x <= self.top_x + self.PADDLE_W + self.BALL:
+                self.ball_y = self.PADDLE_H + self.BALL
+                self.ball_dy = abs(self.ball_dy)
+            else:
+                winner = "bottom"
+        elif self.ball_dy > 0 and self.ball_y >= self.HEIGHT - self.PADDLE_H - self.BALL:
+            if self.bottom_x - self.BALL <= self.ball_x <= self.bottom_x + self.PADDLE_W + self.BALL:
+                self.ball_y = self.HEIGHT - self.PADDLE_H - self.BALL
+                self.ball_dy = -abs(self.ball_dy)
+            else:
+                winner = "top"
+
+        if winner:
+            if winner == "top":
+                self.top_score += 1
+            else:
+                self.bottom_score += 1
+            self.ball_x, self.ball_y = self.WIDTH / 2, self.HEIGHT / 2
+            self.ball_dy = 4.0 if winner == "top" else -4.0
+        return winner
+
+
+def parse_action(text):
+    """Accept only the requested protocol; invalid model text becomes stay."""
+    normalized = " ".join(str(text).strip().lower().split())
+    if normalized == LEFT:
+        return LEFT
+    if normalized == RIGHT:
+        return RIGHT
+    if normalized == STAY:
+        return STAY
+    return STAY
+
+
+async def ask_ai(ai_module, model, prompt, observation):
+    """Send JSON to a model and collect its streamed text response."""
+    messages = [
+        ai_module.system_message(prompt),
+        ai_module.user_message(json.dumps(observation, indent=2)),
+    ]
+    async with ai_module.Agent().run(model, messages) as stream:
+        chunks = []
+        async for event in stream:
+            if isinstance(event, ai_module.events.TextDelta):
+                chunks.append(event.chunk)
+        return "".join(chunks).strip()
+
+
 async def run_ai_agent():
+    """Run Pong with two visible, competing AI agents.
+
+    The bottom player uses AI_SDK_DEFAULT_MODEL, while the top opponent always
+    uses anthropic:claude-sonnet-4-6. Each receives JSON and can see the other
+    model name and prompt in that JSON. Tracebacks are printed for diagnostics;
+    a failed request safely becomes ``stay`` for that frame.
+    """
     try:
         import ai
-        model_name = os.environ.get("AI_SDK_DEFAULT_MODEL", "anthropic/claude-sonnet-4")
-        model = ai.get_model(model_name)
+        player_model_name = os.environ.get("AI_SDK_DEFAULT_MODEL", "openai/gpt-5.4")
+        opponent_model_name = "anthropic:claude-sonnet-4-6"
+        player_model = ai.get_model(player_model_name)
+        opponent_model = ai.get_model(opponent_model_name)
 
-        @ai.tool
-        async def contact_mothership(query: str) -> str:
-            """Contact the mothership for important decisions."""
-            return "Soon."
+        player_prompt = AI_PROMPT + " You are the bottom paddle."
+        opponent_prompt = AI_PROMPT + " You are the top paddle."
+        game = HorizontalPong()
+        import tkinter as tk
+        root = tk.Tk()
+        root.title("Two-AI Pong")
+        canvas = tk.Canvas(root, width=game.WIDTH, height=game.HEIGHT, bg="#101827")
+        canvas.pack()
+        label = tk.Label(root, text="Starting both AI players...")
+        label.pack()
+        closed = False
 
-        agent = ai.Agent(tools=[contact_mothership])
-        messages = [
-            ai.system_message("Use the contact_mothership tool when asked about the future."),
-            ai.user_message("When will the robots take over?"),
-        ]
-        async with agent.run(model, messages) as stream:
-            async for event in stream:
-                if isinstance(event, ai.events.TextDelta):
-                    print(event.chunk, end="", flush=True)
-        print()
+        def close():
+            nonlocal closed
+            closed = True
+            root.destroy()
+
+        root.protocol("WM_DELETE_WINDOW", close)
+
+        while not closed:
+            root.update()
+            player_observation = game.observation("bottom", opponent_model_name, opponent_prompt)
+            opponent_observation = game.observation("top", player_model_name, player_prompt)
+            results = await asyncio.gather(
+                ask_ai(ai, player_model, player_prompt, player_observation),
+                ask_ai(ai, opponent_model, opponent_prompt, opponent_observation),
+                return_exceptions=True,
+            )
+            player_text = results[0] if isinstance(results[0], str) else ""
+            opponent_text = results[1] if isinstance(results[1], str) else ""
+            if not isinstance(results[0], str):
+                print("Player AI error:")
+                traceback.print_exception(results[0])
+            if not isinstance(results[1], str):
+                print("Opponent AI error:")
+                traceback.print_exception(results[1])
+
+            player_action = parse_action(player_text)
+            opponent_action = parse_action(opponent_text)
+            game.move("bottom", player_action)
+            game.move("top", opponent_action)
+            winner = game.step()
+
+            canvas.delete("all")
+            canvas.create_rectangle(game.top_x, 25, game.top_x + game.PADDLE_W, 25 + game.PADDLE_H, fill="#ff8a80")
+            canvas.create_rectangle(game.bottom_x, game.HEIGHT - 25 - game.PADDLE_H,
+                                    game.bottom_x + game.PADDLE_W, game.HEIGHT - 25, fill="#80d8ff")
+            canvas.create_oval(game.ball_x - game.BALL / 2, game.ball_y - game.BALL / 2,
+                               game.ball_x + game.BALL / 2, game.ball_y + game.BALL / 2, fill="#ffffff")
+            label.config(text=(f"Bottom {game.bottom_score} ({player_model_name})  -  "
+                               f"Top {game.top_score} ({opponent_model_name}) | "
+                               f"Player: {player_action} | Opponent: {opponent_action}"))
+            root.update()
+            await asyncio.sleep(0.05)
+    except KeyboardInterrupt:
+        print("Stopping AI Pong...")
     except Exception:
         traceback.print_exc()
         raise
+    finally:
+        try:
+            if not closed:
+                root.destroy()
+        except Exception:
+            pass
 
 
 def main():
-    if len(sys.argv) >= 2 and sys.argv[1] == "--neuron":
-        if len(sys.argv) < 5:
-            raise SystemExit("Usage: main.py --neuron <action> <port> <weight_file>")
-        run_neuron_service(sys.argv[2], int(sys.argv[3]), sys.argv[4])
-    elif len(sys.argv) >= 2 and sys.argv[1] == "--agent":
+    if len(sys.argv) > 1 and sys.argv[1] == "--agent":
         asyncio.run(run_ai_agent())
     else:
-        run_game_loop()
+        run()
 
 
 if __name__ == "__main__":
