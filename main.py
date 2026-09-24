@@ -1,11 +1,10 @@
 """Pong controller and two-AI Pong demonstration.
 
-Run ``python main.py`` for the existing localhost-neuron Pong controller.
-Run ``python main.py --agent`` for a two-AI horizontal Pong match.
+Run ``python main.py`` for the localhost-neuron Pong controller.
+Run ``python main.py --agent`` for the two-AI horizontal Pong match.
 
-The AI match sends JSON observations to two models. Each model must answer with
-exactly ``left - CRL`` or ``right - LRC`` (``stay`` is accepted as a safe
-fallback). Both prompts include the other model's name and prompt.
+This version uses tkinter, included with standard Windows Python installations.
+It does not import or require pygame.
 """
 
 import asyncio
@@ -25,7 +24,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 
 
 # ---------------------------------------------------------------------------
-# Existing localhost-neuron Pong mode
+# Localhost-neuron Pong mode, rendered with tkinter
 # ---------------------------------------------------------------------------
 
 def start_neurons():
@@ -40,14 +39,17 @@ def start_neurons():
 
 
 def run():
-    """Run the original local Flask-neuron Pong experiment."""
+    """Run the original local Flask-neuron Pong experiment without pygame."""
+    import tkinter as tk
+
     processes = start_neurons()
-    screen = None
-    pygame = None
+    root = None
     try:
         time.sleep(1.0)
-        brain = TinyBrain({a: f"http://127.0.0.1:{p}" for a, p in ACTIONS.items()})
+        endpoints = {a: f"http://127.0.0.1:{p}" for a, p in ACTIONS.items()}
+        brain = TinyBrain(endpoints)
         game = PongGame()
+
         if os.environ.get("HEADLESS") == "1":
             while True:
                 observation = game.observation().as_dict()
@@ -56,49 +58,70 @@ def run():
                 brain.learn(action, observation, reward)
                 if done:
                     game.reset()
-        else:
-            import pygame
-            pygame.init()
-            screen = pygame.display.set_mode((game.WIDTH, game.HEIGHT))
-            pygame.display.set_caption("Localhost Neuron Pong")
-            clock = pygame.time.Clock()
-            font = pygame.font.Font(None, 24)
-            episode = hits = frames = 0
-            total_reward = 0.0
-            running = True
-            while running:
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        running = False
-                observation = game.observation().as_dict()
-                action, scores = brain.choose_action(observation)
-                _, reward, done, hit = game.step(action)
-                brain.learn(action, observation, reward)
-                total_reward += reward
-                hits += int(hit)
-                frames += 1
-                screen.fill((15, 20, 35))
-                pygame.draw.rect(screen, (230, 230, 240),
-                                 (game.paddle_x, game.paddle_y,
-                                  game.PADDLE_W, game.PADDLE_H))
-                pygame.draw.circle(screen, (80, 220, 150),
-                                   (int(game.ball_x), int(game.ball_y)), game.BALL_SIZE // 2)
-                text = f"Episode {episode}  Score {hits}  Reward {total_reward:.1f}"
-                screen.blit(font.render(text, True, (240, 240, 240)), (10, 10))
-                pygame.display.flip()
-                clock.tick(60)
-                if done:
-                    episode += 1
-                    hits = 0
-                    total_reward = 0.0
-                    game.reset()
+            return
+
+        root = tk.Tk()
+        root.title("Localhost Neuron Pong")
+        canvas = tk.Canvas(root, width=game.WIDTH, height=game.HEIGHT, bg="#0f1423")
+        canvas.pack()
+        status = tk.StringVar()
+        tk.Label(root, textvariable=status).pack()
+
+        state = {"episode": 1, "score": 0, "reward": 0.0, "running": True}
+
+        def close():
+            state["running"] = False
+            root.destroy()
+
+        def tick():
+            if not state["running"]:
+                return
+            observation = game.observation().as_dict()
+            action, scores = brain.choose_action(observation)
+            _, reward, done, hit = game.step(action)
+            brain.learn(action, observation, reward)
+            state["reward"] += reward
+            state["score"] += int(hit)
+
+            canvas.delete("all")
+            canvas.create_rectangle(
+                game.paddle_x, game.paddle_y,
+                game.paddle_x + game.PADDLE_W,
+                game.paddle_y + game.PADDLE_H,
+                fill="#eeeeee",
+            )
+            canvas.create_oval(
+                game.ball_x - game.BALL_SIZE / 2,
+                game.ball_y - game.BALL_SIZE / 2,
+                game.ball_x + game.BALL_SIZE / 2,
+                game.ball_y + game.BALL_SIZE / 2,
+                fill="#50dc96",
+            )
+            status.set(
+                f"Episode {state['episode']} | Score {state['score']} | "
+                f"Reward {state['reward']:.1f} | Action: {action}"
+            )
+
+            if done:
+                state["episode"] += 1
+                state["score"] = 0
+                state["reward"] = 0.0
+                game.reset()
+            root.after(16, tick)
+
+        root.protocol("WM_DELETE_WINDOW", close)
+        tick()
+        root.mainloop()
     except KeyboardInterrupt:
         print("Stopping experiment...")
     except Exception:
         traceback.print_exc()
     finally:
-        if screen is not None and pygame is not None:
-            pygame.quit()
+        if root is not None:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
         for process in processes:
             process.terminate()
         for process in processes:
@@ -132,10 +155,8 @@ class HorizontalPong:
 
     def reset(self):
         self.ball_x, self.ball_y = self.WIDTH / 2, self.HEIGHT / 2
-        self.ball_dx = 5.0
-        self.ball_dy = 4.0
-        self.top_x = self.WIDTH / 2 - self.PADDLE_W / 2
-        self.bottom_x = self.WIDTH / 2 - self.PADDLE_W / 2
+        self.ball_dx, self.ball_dy = 5.0, 4.0
+        self.top_x = self.bottom_x = self.WIDTH / 2 - self.PADDLE_W / 2
         self.top_score = self.bottom_score = 0
 
     def observation(self, side, opponent_model, opponent_prompt):
@@ -153,12 +174,7 @@ class HorizontalPong:
         }
 
     def move(self, side, action):
-        if action == LEFT:
-            change = -18
-        elif action == RIGHT:
-            change = 18
-        else:
-            change = 0
+        change = -18 if action == LEFT else 18 if action == RIGHT else 0
         if side == "top":
             self.top_x = max(0, min(self.WIDTH - self.PADDLE_W, self.top_x + change))
         else:
@@ -195,19 +211,11 @@ class HorizontalPong:
 
 
 def parse_action(text):
-    """Accept only the requested protocol; invalid model text becomes stay."""
     normalized = " ".join(str(text).strip().lower().split())
-    if normalized == LEFT:
-        return LEFT
-    if normalized == RIGHT:
-        return RIGHT
-    if normalized == STAY:
-        return STAY
-    return STAY
+    return normalized if normalized in {LEFT, RIGHT, STAY} else STAY
 
 
 async def ask_ai(ai_module, model, prompt, observation):
-    """Send JSON to a model and collect its streamed text response."""
     messages = [
         ai_module.system_message(prompt),
         ai_module.user_message(json.dumps(observation, indent=2)),
@@ -221,24 +229,20 @@ async def ask_ai(ai_module, model, prompt, observation):
 
 
 async def run_ai_agent():
-    """Run Pong with two visible, competing AI agents.
-
-    The bottom player uses AI_SDK_DEFAULT_MODEL, while the top opponent always
-    uses anthropic:claude-sonnet-4-6. Each receives JSON and can see the other
-    model name and prompt in that JSON. Tracebacks are printed for diagnostics;
-    a failed request safely becomes ``stay`` for that frame.
-    """
+    """Run two AI players with JSON observations and traceback diagnostics."""
+    root = None
     try:
         import ai
+        import tkinter as tk
+
         player_model_name = os.environ.get("AI_SDK_DEFAULT_MODEL", "openai/gpt-5.4")
         opponent_model_name = "anthropic:claude-sonnet-4-6"
         player_model = ai.get_model(player_model_name)
         opponent_model = ai.get_model(opponent_model_name)
-
         player_prompt = AI_PROMPT + " You are the bottom paddle."
         opponent_prompt = AI_PROMPT + " You are the top paddle."
+
         game = HorizontalPong()
-        import tkinter as tk
         root = tk.Tk()
         root.title("Two-AI Pong")
         canvas = tk.Canvas(root, width=game.WIDTH, height=game.HEIGHT, bg="#101827")
@@ -272,19 +276,21 @@ async def run_ai_agent():
                 print("Opponent AI error:")
                 traceback.print_exception(results[1])
 
-            player_action = parse_action(player_text)
-            opponent_action = parse_action(opponent_text)
+            player_action, opponent_action = parse_action(player_text), parse_action(opponent_text)
             game.move("bottom", player_action)
             game.move("top", opponent_action)
-            winner = game.step()
+            game.step()
 
             canvas.delete("all")
-            canvas.create_rectangle(game.top_x, 25, game.top_x + game.PADDLE_W, 25 + game.PADDLE_H, fill="#ff8a80")
+            canvas.create_rectangle(game.top_x, 25, game.top_x + game.PADDLE_W,
+                                    25 + game.PADDLE_H, fill="#ff8a80")
             canvas.create_rectangle(game.bottom_x, game.HEIGHT - 25 - game.PADDLE_H,
-                                    game.bottom_x + game.PADDLE_W, game.HEIGHT - 25, fill="#80d8ff")
+                                    game.bottom_x + game.PADDLE_W, game.HEIGHT - 25,
+                                    fill="#80d8ff")
             canvas.create_oval(game.ball_x - game.BALL / 2, game.ball_y - game.BALL / 2,
-                               game.ball_x + game.BALL / 2, game.ball_y + game.BALL / 2, fill="#ffffff")
-            label.config(text=(f"Bottom {game.bottom_score} ({player_model_name})  -  "
+                               game.ball_x + game.BALL / 2, game.ball_y + game.BALL / 2,
+                               fill="#ffffff")
+            label.config(text=(f"Bottom {game.bottom_score} ({player_model_name}) - "
                                f"Top {game.top_score} ({opponent_model_name}) | "
                                f"Player: {player_action} | Opponent: {opponent_action}"))
             root.update()
@@ -295,11 +301,11 @@ async def run_ai_agent():
         traceback.print_exc()
         raise
     finally:
-        try:
-            if not closed:
+        if root is not None:
+            try:
                 root.destroy()
-        except Exception:
-            pass
+            except Exception:
+                pass
 
 
 def main():
