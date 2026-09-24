@@ -1,9 +1,10 @@
-"""Localhost neuron Pong: one-file version.
+"""Localhost neuron Pong plus an optional AI SDK agent demonstration.
 
-The game starts three Flask neuron services on 127.0.0.1. HTTP requests carry
-observations to each neuron, and reward feedback changes its small weight set.
+Run ``python main.py`` for Pong or ``python main.py --agent`` for the small
+AI SDK example. The Pong neurons remain localhost-only.
 """
 
+import asyncio
 import json
 import os
 import random
@@ -71,7 +72,6 @@ class PongGame:
         elif action == "down":
             self.paddle_y += self.paddle_speed
         self.paddle_y = max(0, min(self.HEIGHT - self.PADDLE_H, self.paddle_y))
-
         self.ball_x += self.ball_dx
         self.ball_y += self.ball_dy
         if self.ball_y <= 0 or self.ball_y + self.BALL_SIZE >= self.HEIGHT:
@@ -105,11 +105,10 @@ def load_weights(path):
 
 
 def save_weights(path, weights):
-    if path:
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as handle:
-            json.dump(weights, handle, indent=2)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(weights, handle, indent=2)
 
 
 def create_neuron_app(action, weight_file):
@@ -162,7 +161,6 @@ def run_neuron_service(action, port, weight_file):
 class TinyBrain:
     def __init__(self, endpoints):
         self.endpoints = endpoints
-        # Keep connect and read limits separate so a dead service cannot stall the game.
         self.timeout = (0.08, 0.20)
         self.reported_failures = set()
 
@@ -174,8 +172,6 @@ class TinyBrain:
                 response.raise_for_status()
                 scores[action] = float(response.json().get("score", 0.0))
             except requests.RequestException as exc:
-                # Do not print a full traceback every frame. Startup retries below
-                # catch normal races; this message is only printed once per neuron.
                 if action not in self.reported_failures:
                     print(f"Neuron {action} unavailable at {url}: {exc}")
                     self.reported_failures.add(action)
@@ -191,7 +187,6 @@ class TinyBrain:
             )
             response.raise_for_status()
         except requests.RequestException:
-            # Learning failure should not stop the visual experiment.
             pass
 
 
@@ -201,18 +196,12 @@ def start_neurons():
         weight_file = PROJECT_DIR / ".brain_weights" / f"{action}.json"
         processes.append(subprocess.Popen(
             [sys.executable, str(PROJECT_DIR / "main.py"), "--neuron", action,
-             str(port), str(weight_file)],
-            cwd=str(PROJECT_DIR),
+             str(port), str(weight_file)], cwd=str(PROJECT_DIR)
         ))
     return processes
 
 
 def wait_for_neurons(endpoints, processes, seconds=12.0):
-    """Wait for Flask to bind before sending game traffic.
-
-    The original one-second sleep caused a startup race: the game attempted
-    /signal while Flask was still importing and binding ports 5001-5003.
-    """
     deadline = time.monotonic() + seconds
     pending = set(endpoints)
     while pending and time.monotonic() < deadline:
@@ -225,13 +214,8 @@ def wait_for_neurons(endpoints, processes, seconds=12.0):
                 pass
         if pending:
             time.sleep(0.15)
-
     if pending:
-        dead = ", ".join(sorted(pending))
-        for process in processes:
-            if process.poll() is not None:
-                print(f"A neuron process exited with code {process.returncode}.")
-        raise RuntimeError(f"Neuron services did not become ready: {dead}")
+        raise RuntimeError(f"Neuron services did not become ready: {', '.join(sorted(pending))}")
 
 
 def draw_game(screen, game, font, episode, hits, reward):
@@ -248,23 +232,19 @@ def draw_game(screen, game, font, episode, hits, reward):
 def run_game_loop():
     if os.environ.get("HEADLESS") != "1" and pygame is None:
         raise RuntimeError("Pygame is not installed. Run: python -m pip install pygame")
-
     processes = start_neurons()
     screen = None
     try:
-        endpoints = {action: f"http://127.0.0.1:{port}" for action, port in ACTIONS.items()}
+        endpoints = {a: f"http://127.0.0.1:{p}" for a, p in ACTIONS.items()}
         wait_for_neurons(endpoints, processes)
-        brain = TinyBrain(endpoints)
-        game = PongGame()
+        brain, game = TinyBrain(endpoints), PongGame()
         episode, total_reward, hits, frames = 1, 0.0, 0, 0
         clock = font = None
-
         if os.environ.get("HEADLESS") != "1":
             pygame.init()
             screen = pygame.display.set_mode((game.WIDTH, game.HEIGHT))
             pygame.display.set_caption("Localhost Neuron Pong")
-            clock = pygame.time.Clock()
-            font = pygame.font.Font(None, 24)
+            clock, font = pygame.time.Clock(), pygame.font.Font(None, 24)
 
         running = True
         while running:
@@ -272,7 +252,6 @@ def run_game_loop():
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         running = False
-
             observation = game.observation().as_dict()
             action, scores = brain.choose_action(observation)
             _, reward, done, hit = game.step(action)
@@ -280,17 +259,13 @@ def run_game_loop():
             total_reward += reward
             hits += int(hit)
             frames += 1
-
             if screen:
                 draw_game(screen, game, font, episode, hits, total_reward)
                 clock.tick(60)
             elif frames % 60 == 0:
                 print(f"episode={episode} score={hits} reward={total_reward:.1f} last={action} scores={scores}")
-
             if done:
-                episode += 1
-                total_reward = 0.0
-                hits = 0
+                episode, total_reward, hits = episode + 1, 0.0, 0
                 game.reset()
     except KeyboardInterrupt:
         print("Stopping experiment...")
@@ -308,11 +283,48 @@ def run_game_loop():
                 process.kill()
 
 
+async def run_ai_agent():
+    """Run the requested AI SDK agent example with full traceback reporting."""
+    try:
+        import ai
+
+        # Supported examples include:
+        # ai.get_model()                         # reads AI_SDK_DEFAULT_MODEL
+        # ai.get_model("openai/gpt-5.4")        # gateway default
+        # ai.get_model("gateway:openai/gpt-5.4")
+        # ai.get_model("openai:gpt-5.4")
+        # ai.get_model("anthropic:claude-sonnet-4-6")
+        model_name = os.environ.get("AI_SDK_DEFAULT_MODEL", "anthropic/claude-sonnet-4")
+        model = ai.get_model(model_name)
+
+        @ai.tool
+        async def contact_mothership(query: str) -> str:
+            """Contact the mothership for important decisions."""
+            return "Soon."
+
+        agent = ai.Agent(tools=[contact_mothership])
+        messages = [
+            ai.system_message("Use the contact_mothership tool when asked about the future."),
+            ai.user_message("When will the robots take over?"),
+        ]
+
+        async with agent.run(model, messages) as stream:
+            async for event in stream:
+                if isinstance(event, ai.events.TextDelta):
+                    print(event.chunk, end="", flush=True)
+        print()
+    except Exception:
+        traceback.print_exc()
+        raise
+
+
 def main():
     if len(sys.argv) >= 2 and sys.argv[1] == "--neuron":
         if len(sys.argv) < 5:
             raise SystemExit("Usage: main.py --neuron <action> <port> <weight_file>")
         run_neuron_service(sys.argv[2], int(sys.argv[3]), sys.argv[4])
+    elif len(sys.argv) >= 2 and sys.argv[1] == "--agent":
+        asyncio.run(run_ai_agent())
     else:
         run_game_loop()
 
